@@ -1,17 +1,24 @@
 package microcluster
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"crypto/x509"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"time"
 
+	"github.com/canonical/go-dqlite"
+	dqliteClient "github.com/canonical/go-dqlite/client"
 	"github.com/canonical/lxd/lxd/db/schema"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/logger"
@@ -24,6 +31,7 @@ import (
 	internalClient "github.com/canonical/microcluster/internal/rest/client"
 	internalTypes "github.com/canonical/microcluster/internal/rest/types"
 	"github.com/canonical/microcluster/internal/sys"
+	"github.com/canonical/microcluster/internal/trust"
 	"github.com/canonical/microcluster/rest"
 	"github.com/canonical/microcluster/rest/types"
 )
@@ -204,6 +212,247 @@ func (m *MicroCluster) JoinCluster(ctx context.Context, name string, address str
 	}
 
 	return c.ControlDaemon(ctx, internalTypes.Control{JoinToken: token, Address: addr, Name: name, InitConfig: initConfig})
+}
+
+type Member struct {
+	// dqlite.NodeInfo fields
+	dqliteID uint64
+	Address  string `json:"address" yaml:"address"`
+	Role     string `json:"role" yaml:"role"`
+
+	Name string `json:"name" yaml:"name"`
+}
+
+func (m Member) toNodeInfo() (*dqlite.NodeInfo, error) {
+	var role dqliteClient.NodeRole
+	switch m.Role {
+	case "voter":
+		role = dqliteClient.Voter
+	case "stand-by":
+		role = dqliteClient.StandBy
+	case "spare":
+		role = dqliteClient.Spare
+	default:
+		return nil, fmt.Errorf("invalid dqlite role %q", m.Role)
+	}
+
+	return &dqlite.NodeInfo{
+		ID:      m.dqliteID,
+		Role:    role,
+		Address: m.Address,
+	}, nil
+}
+
+func (m *MicroCluster) GetClusterMembers() ([]Member, error) {
+	storePath := path.Join(m.FileSystem.DatabaseDir, "cluster.yaml")
+	store, err := dqliteClient.NewYamlNodeStore(storePath)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read %q: %w", storePath, err)
+	}
+
+	nodeInfo, err := store.Get(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read from node store: %w", err)
+	}
+
+	var members []Member
+	for _, info := range nodeInfo {
+		members = append(members, Member{
+			dqliteID: info.ID,
+			Address:  info.Address,
+			Role:     info.Role.String(),
+			Name:     "TBD",
+		})
+	}
+
+	return members, nil
+}
+
+// RecoverFromQuorumLoss can be used to recover database access when a quorum of
+// members is lost and cannot be recovered (e.g. hardware failure or irreversible
+// network changes).
+// This function requires that:
+//   - All cluster members' databases are not running
+//   - The current member has the most up-to-date raft log (usually the member
+//     which was most recently the leader)
+//
+// RecoverFromQuorumLoss will take a database backup before attempting the
+// recovery operation.
+//
+// RecoverFromQuorumLoss should be invoked _exactly once_ for the entire cluster.
+// This function creates an xz-compressed tarball
+// path.Join(m.FileSystem.StateDir, "recovery_db.tar.xz"). This tarball should
+// be manually copied by the user to the state dir of all other cluster members.
+//
+// On start, Microcluster will automatically check for & load the recovery
+// tarball. A database backup will be taken before the load.
+//
+// RecoverFromQuorumLoss also updates the trust store with the new IP addresses
+// provided in []Member.
+func (m *MicroCluster) RecoverFromQuorumLoss(members []Member) error {
+	// Double check to make sure the cluster configuration has actually changed
+	oldMembers, err := m.GetClusterMembers()
+	if err != nil {
+		return err
+	}
+
+	countNewMembers := 0
+	for _, newMember := range members {
+		for _, oldMember := range oldMembers {
+			if newMember.dqliteID == oldMember.dqliteID && newMember.Name == oldMember.Name {
+				countNewMembers += countNewMembers
+				break
+			}
+		}
+	}
+
+	if countNewMembers != len(oldMembers) {
+		return fmt.Errorf("cluster members cannot be added or removed during recovery")
+	}
+
+	// Ensure we weren't passed any invalid addresses
+	for _, member := range members {
+		_, err = netip.ParseAddrPort(member.Address)
+		if err != nil {
+			return fmt.Errorf("Invalid address %q: %w", member.Address, err)
+		}
+	}
+
+	// Set up our new cluster configuration
+	nodeInfo := make([]dqlite.NodeInfo, len(members))
+	for _, member := range members {
+		info, err := member.toNodeInfo()
+		if err != nil {
+			return err
+		}
+		nodeInfo = append(nodeInfo, *info)
+	}
+
+	// Check each cluster member's /1.0 endpoint to ensure that they are unreachable
+	// This is a sanity check to ensure that we're not reconfiguring a cluster
+	// that still has quorum
+	// It may also be possible to check the raft term of each surviving member
+	// and redirect the user to call RecoverFromQuorumLoss on that member instead.
+	//TODO
+
+	// Ensure that the daemon is not running
+	socketPath := m.FileSystem.ControlSocketPath()
+	_, err = os.Stat(socketPath)
+	if err == nil {
+		return fmt.Errorf("daemon is running (socket path exists: %q)", socketPath)
+	}
+
+	//FIXME: Take a DB backup
+
+	err = dqlite.ReconfigureMembershipExt(m.FileSystem.DatabaseDir, nodeInfo)
+	if err != nil {
+		return fmt.Errorf("dqlite recovery: %w", err)
+	}
+
+	// Tar up the m.FileSystem.DatabaseDir and write to `dbExportPath`
+	//TODO
+
+	// Now that the DB has regained quorum, we can modify the entries in the
+	// internal_cluster_members table to indicate that they are down
+	//TODO - This also can't be done here
+
+	updateTrustStore(m.FileSystem.TrustDir, members)
+
+	return nil
+}
+
+func createRecoveryTarball(stateDir string, databaseDir string) error {
+	dbFS := os.DirFS(databaseDir)
+	recoveryGlob, err := fs.Glob(dbFS, "*")
+	if err != nil {
+		return fmt.Errorf("%w", err)
+	}
+
+	tarballPath := path.Join(stateDir, "recovery_db.tar.gz")
+
+	return createTarball(tarballPath, databaseDir, recoveryGlob)
+}
+
+func createTarball(tarballPath string, dir string, files []string) error {
+	tarball, err := os.Create(tarballPath)
+	if err != nil {
+		return fmt.Errorf("create recovery tarball %q: %w", tarballPath, err)
+	}
+
+	gzWriter := gzip.NewWriter(tarball)
+	tarWriter := tar.NewWriter(gzWriter)
+
+	for _, filename := range files {
+		file, err := os.Open(path.Join(dir, filename))
+		if err != nil {
+			return fmt.Errorf("open %q: %w", path.Join(dir, filename), err)
+		}
+
+		stat, err := file.Stat()
+		if err != nil {
+			return fmt.Errorf("stat %q: %w", path.Join(dir, filename), err)
+		}
+
+		// Note: header.Name is set to the basename of stat. If dqlite starts
+		// using subdirs in the DB dir, this will need modification
+		header, err := tar.FileInfoHeader(stat, filename)
+		if err != nil {
+			return fmt.Errorf("")
+		}
+
+		err = tarWriter.WriteHeader(header)
+		if err != nil {
+			return fmt.Errorf("write %q: %w", tarballPath, err)
+		}
+
+		_, err = io.Copy(tarWriter, file)
+		if err != nil {
+			return fmt.Errorf("write %q: %w", tarballPath, err)
+		}
+	}
+
+	//FIXME: Does tarWriter close gzWriter and tarball?
+	err = tarWriter.Close()
+	if err != nil {
+		return fmt.Errorf("close recovery tarball %q: %w", tarballPath, err)
+	}
+
+	return nil
+}
+
+// Update the trust store with the new member addresses
+func updateTrustStore(dir string, members []Member) error {
+	fsWatcher, err := sys.NewWatcher(context.Background(), dir)
+	if err != nil {
+		return err
+	}
+
+	trustStore, err := trust.Init(fsWatcher, nil, dir)
+	if err != nil {
+		return err
+	}
+
+	remotes := trustStore.Remotes()
+	remotesByName := remotes.RemotesByName()
+
+	trustMembers := make([]internalTypes.ClusterMember, len(members))
+	for _, member := range members {
+		cert := remotesByName[member.Name].Certificate
+		addr, err := netip.ParseAddrPort(member.Address)
+		if err != nil {
+			return fmt.Errorf("Invalid address %q: %w", member.Address, err)
+		}
+
+		trustMembers = append(trustMembers, internalTypes.ClusterMember{
+			ClusterMemberLocal: internalTypes.ClusterMemberLocal{
+				Name:        member.Name,
+				Address:     types.AddrPort{AddrPort: addr},
+				Certificate: cert,
+			},
+		})
+	}
+
+	return remotes.Replace(dir, trustMembers...)
 }
 
 // NewJoinToken creates and records a new join token containing all the necessary credentials for joining a cluster.

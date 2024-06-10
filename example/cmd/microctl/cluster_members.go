@@ -1,10 +1,16 @@
 package main
 
 import (
+	"io"
+	"os"
 	"sort"
 
+	"github.com/canonical/lxd/shared"
 	cli "github.com/canonical/lxd/shared/cmd"
+	"github.com/canonical/lxd/shared/termios"
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
+	"gopkg.in/yaml.v2"
 
 	"github.com/canonical/microcluster/client"
 	"github.com/canonical/microcluster/microcluster"
@@ -124,6 +130,70 @@ func (c *cmdClusterMemberRemove) run(cmd *cobra.Command, args []string) error {
 	}
 
 	err = client.DeleteClusterMember(cmd.Context(), args[0], c.flagForce)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type cmdRecover struct {
+	common *CmdControl
+
+	//flagForce bool
+}
+
+func (c *cmdRecover) Command() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "recover",
+		Short: "Recover the cluster from this node if quorum is lost",
+		RunE:  c.Run,
+	}
+
+	//cmd.Flags().BoolVarP(&c.flagForce, "force", "f", false, "Forcibly remove the cluster member")
+
+	return cmd
+}
+
+func (c *cmdRecover) Run(cmd *cobra.Command, args []string) error {
+	/*if len(args) != 1 {
+		return cmd.Help()
+	}*/
+
+	m, err := microcluster.App(microcluster.Args{StateDir: c.common.FlagStateDir, Verbose: c.common.FlagLogVerbose, Debug: c.common.FlagLogDebug})
+	if err != nil {
+		return err
+	}
+
+	members, err := m.GetClusterMembers()
+	if err != nil {
+		return err
+	}
+
+	membersYaml, err := yaml.Marshal(members)
+	if err != nil {
+		return err
+	}
+
+	var content []byte
+	if !termios.IsTerminal(unix.Stdin) {
+		content, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+	} else {
+		//FIXME: Editor comment
+
+		content, err = shared.TextEditor("", membersYaml)
+		if err != nil {
+			return err
+		}
+	}
+
+	newMembers := []microcluster.Member{}
+	err = yaml.Unmarshal(content, &newMembers)
+
+	err = m.RecoverFromQuorumLoss(newMembers)
 	if err != nil {
 		return err
 	}
