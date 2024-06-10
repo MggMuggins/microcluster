@@ -85,7 +85,11 @@ func (s *OS) init(createDir bool) error {
 
 // ControlSocket returns the full path to the control.socket file that this daemon is listening on.
 func (s *OS) ControlSocket() api.URL {
-	return *api.NewURL().Scheme("http").Host(filepath.Join(s.StateDir, "control.socket"))
+	return *api.NewURL().Scheme("http").Host(s.ControlSocketPath())
+}
+
+func (s *OS) ControlSocketPath() string {
+	return filepath.Join(s.StateDir, "control.socket")
 }
 
 // DatabasePath returns the path of the database file managed by dqlite.

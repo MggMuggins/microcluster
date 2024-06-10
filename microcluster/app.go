@@ -216,7 +216,7 @@ func (m *MicroCluster) JoinCluster(ctx context.Context, name string, address str
 
 type Member struct {
 	// dqlite.NodeInfo fields
-	dqliteID uint64
+	DqliteID uint64 `json:"id" yaml:"id"`
 	Address  string `json:"address" yaml:"address"`
 	Role     string `json:"role" yaml:"role"`
 
@@ -237,7 +237,7 @@ func (m Member) toNodeInfo() (*dqlite.NodeInfo, error) {
 	}
 
 	return &dqlite.NodeInfo{
-		ID:      m.dqliteID,
+		ID:      m.DqliteID,
 		Role:    role,
 		Address: m.Address,
 	}, nil
@@ -258,7 +258,7 @@ func (m *MicroCluster) GetClusterMembers() ([]Member, error) {
 	var members []Member
 	for _, info := range nodeInfo {
 		members = append(members, Member{
-			dqliteID: info.ID,
+			DqliteID: info.ID,
 			Address:  info.Address,
 			Role:     info.Role.String(),
 			Name:     "TBD",
@@ -299,8 +299,8 @@ func (m *MicroCluster) RecoverFromQuorumLoss(members []Member) error {
 	countNewMembers := 0
 	for _, newMember := range members {
 		for _, oldMember := range oldMembers {
-			if newMember.dqliteID == oldMember.dqliteID && newMember.Name == oldMember.Name {
-				countNewMembers += countNewMembers
+			if newMember.DqliteID == oldMember.DqliteID && newMember.Name == oldMember.Name {
+				countNewMembers += 1
 				break
 			}
 		}
@@ -319,7 +319,7 @@ func (m *MicroCluster) RecoverFromQuorumLoss(members []Member) error {
 	}
 
 	// Set up our new cluster configuration
-	nodeInfo := make([]dqlite.NodeInfo, len(members))
+	nodeInfo := make([]dqlite.NodeInfo, 0, len(members))
 	for _, member := range members {
 		info, err := member.toNodeInfo()
 		if err != nil {
@@ -344,17 +344,19 @@ func (m *MicroCluster) RecoverFromQuorumLoss(members []Member) error {
 
 	//FIXME: Take a DB backup
 
+	fmt.Printf("ReconfigureMembership(%s, %v)\n", m.FileSystem.DatabaseDir, nodeInfo)
+
 	err = dqlite.ReconfigureMembershipExt(m.FileSystem.DatabaseDir, nodeInfo)
 	if err != nil {
 		return fmt.Errorf("dqlite recovery: %w", err)
 	}
 
 	// Tar up the m.FileSystem.DatabaseDir and write to `dbExportPath`
-	//TODO
+	createRecoveryTarball(m.FileSystem.StateDir, m.FileSystem.DatabaseDir)
 
 	// Now that the DB has regained quorum, we can modify the entries in the
 	// internal_cluster_members table to indicate that they are down
-	//TODO - This also can't be done here
+	//TODO - This can't be done here
 
 	updateTrustStore(m.FileSystem.TrustDir, members)
 
@@ -363,16 +365,29 @@ func (m *MicroCluster) RecoverFromQuorumLoss(members []Member) error {
 
 func createRecoveryTarball(stateDir string, databaseDir string) error {
 	dbFS := os.DirFS(databaseDir)
-	recoveryGlob, err := fs.Glob(dbFS, "*")
+	dbFiles, err := fs.Glob(dbFS, "*")
 	if err != nil {
 		return fmt.Errorf("%w", err)
 	}
 
 	tarballPath := path.Join(stateDir, "recovery_db.tar.gz")
 
-	return createTarball(tarballPath, databaseDir, recoveryGlob)
+	// info.yaml is used by go-dqlite to keep track of the current cluster member's
+	// ID and address. We shouldn't replicate the recovery member's info.yaml
+	// to all other members, so exclude it from the tarball:
+	for indx, filename := range dbFiles {
+		if filename == "info.yaml" {
+			newlen := len(dbFiles) - 1
+			dbFiles[indx] = dbFiles[newlen]
+			dbFiles = dbFiles[:newlen]
+			break
+		}
+	}
+
+	return createTarball(tarballPath, databaseDir, dbFiles)
 }
 
+// create tarball at tarballPath with files path.Join(dir, file)
 func createTarball(tarballPath string, dir string, files []string) error {
 	tarball, err := os.Create(tarballPath)
 	if err != nil {
@@ -383,21 +398,23 @@ func createTarball(tarballPath string, dir string, files []string) error {
 	tarWriter := tar.NewWriter(gzWriter)
 
 	for _, filename := range files {
-		file, err := os.Open(path.Join(dir, filename))
+		filepath := path.Join(dir, filename)
+
+		file, err := os.Open(filepath)
 		if err != nil {
-			return fmt.Errorf("open %q: %w", path.Join(dir, filename), err)
+			return fmt.Errorf("open %q: %w", filepath, err)
 		}
 
 		stat, err := file.Stat()
 		if err != nil {
-			return fmt.Errorf("stat %q: %w", path.Join(dir, filename), err)
+			return fmt.Errorf("stat %q: %w", filepath, err)
 		}
 
 		// Note: header.Name is set to the basename of stat. If dqlite starts
 		// using subdirs in the DB dir, this will need modification
 		header, err := tar.FileInfoHeader(stat, filename)
 		if err != nil {
-			return fmt.Errorf("")
+			return fmt.Errorf("create tar header for %q: %w", filepath, err)
 		}
 
 		err = tarWriter.WriteHeader(header)
@@ -409,10 +426,24 @@ func createTarball(tarballPath string, dir string, files []string) error {
 		if err != nil {
 			return fmt.Errorf("write %q: %w", tarballPath, err)
 		}
+
+		err = file.Close()
+		if err != nil {
+			return fmt.Errorf("close %q: %w", filepath, err)
+		}
 	}
 
-	//FIXME: Does tarWriter close gzWriter and tarball?
 	err = tarWriter.Close()
+	if err != nil {
+		return fmt.Errorf("close recovery tarball %q: %w", tarballPath, err)
+	}
+
+	err = gzWriter.Close()
+	if err != nil {
+		return fmt.Errorf("close recovery tarball %q: %w", tarballPath, err)
+	}
+
+	err = tarball.Close()
 	if err != nil {
 		return fmt.Errorf("close recovery tarball %q: %w", tarballPath, err)
 	}
