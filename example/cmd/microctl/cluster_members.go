@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"sort"
@@ -32,6 +33,9 @@ func (c *cmdClusterMembers) command() *cobra.Command {
 
 	var cmdList = cmdClusterMembersList{common: c.common}
 	cmd.AddCommand(cmdList.command())
+
+	var cmdRestore = cmdRecover{common: c.common}
+	cmd.AddCommand(cmdRestore.Command())
 
 	return cmd
 }
@@ -195,7 +199,7 @@ func (c *cmdRecover) Run(cmd *cobra.Command, args []string) error {
 
 	err = m.RecoverFromQuorumLoss(newMembers)
 	if err != nil {
-		return err
+		return fmt.Errorf("cluster recovery: %w", err)
 	}
 
 	return nil
