@@ -242,15 +242,6 @@ type Member struct {
 	Name string `json:"name" yaml:"name"`
 }
 
-func newMember(name string, info dqlite.NodeInfo) Member {
-	return Member{
-		DqliteID: info.ID,
-		Address:  info.Address,
-		Role:     info.Role.String(),
-		Name:     name,
-	}
-}
-
 func (m Member) toNodeInfo() (*dqlite.NodeInfo, error) {
 	var role dqliteClient.NodeRole
 	switch m.Role {
@@ -289,7 +280,12 @@ func (m *MicroCluster) GetClusterMembers() ([]Member, error) {
 	for _, remote := range remotesByName {
 		for _, info := range nodeInfo {
 			if remote.Address.String() == info.Address {
-				members = append(members, newMember(remote.Name, info))
+				members = append(members, Member{
+					DqliteID: info.ID,
+					Address:  info.Address,
+					Role:     info.Role.String(),
+					Name:     remote.Name,
+				})
 			}
 		}
 	}
@@ -554,7 +550,26 @@ func (m *MicroCluster) maybeUnpackRecoveryTarball() error {
 
 	// check for a valid cluster.yaml
 	clusterYamlPath := path.Join(unpackDir, "cluster.yaml")
-	_, err = dumpYamlNodeStore(clusterYamlPath)
+	nodeInfo, err := dumpYamlNodeStore(clusterYamlPath)
+	if err != nil {
+		return err
+	}
+
+	// And update the local trust store with any changed addresses
+	existingMembers, err := m.GetClusterMembers()
+	if err != nil {
+		return err
+	}
+
+	for _, member := range existingMembers {
+		for _, nodeInfo := range nodeInfo {
+			if member.DqliteID == nodeInfo.ID {
+				member.Address = nodeInfo.Address
+			}
+		}
+	}
+
+	err = updateTrustStore(m.FileSystem.TrustDir, existingMembers)
 	if err != nil {
 		return err
 	}
@@ -586,8 +601,6 @@ func (m *MicroCluster) maybeUnpackRecoveryTarball() error {
 	if err != nil {
 		return fmt.Errorf("remove %q: %w", tarballPath, err)
 	}
-
-	//TODO Update the trust store with new member addrs
 
 	return nil
 }
