@@ -278,9 +278,20 @@ func (m *MicroCluster) GetClusterMembers() ([]Member, error) {
 		return nil, err
 	}
 
+	remotes, err := readTrustStore(m.FileSystem.TrustDir)
+	if err != nil {
+		return nil, err
+	}
+
+	remotesByName := remotes.RemotesByName()
+
 	var members []Member
-	for _, info := range nodeInfo {
-		members = append(members, newMember("TBD", info))
+	for _, remote := range remotesByName {
+		for _, info := range nodeInfo {
+			if remote.Address.String() == info.Address {
+				members = append(members, newMember(remote.Name, info))
+			}
+		}
 	}
 
 	return members, nil
@@ -470,19 +481,27 @@ func createTarball(tarballPath string, dir string, files []string) error {
 	return nil
 }
 
-// Update the trust store with the new member addresses
-func updateTrustStore(dir string, members []Member) error {
+func readTrustStore(dir string) (*trust.Remotes, error) {
 	fsWatcher, err := sys.NewWatcher(context.Background(), dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	trustStore, err := trust.Init(fsWatcher, nil, dir)
 	if err != nil {
+		return nil, err
+	}
+
+	return trustStore.Remotes(), nil
+}
+
+// Update the trust store with the new member addresses
+func updateTrustStore(dir string, members []Member) error {
+	remotes, err := readTrustStore(dir)
+	if err != nil {
 		return err
 	}
 
-	remotes := trustStore.Remotes()
 	remotesByName := remotes.RemotesByName()
 
 	trustMembers := make([]internalTypes.ClusterMember, len(members))
