@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -71,10 +72,14 @@ func App(args Args) (*MicroCluster, error) {
 		return nil, err
 	}
 
-	return &MicroCluster{
+	m := &MicroCluster{
 		FileSystem: os,
 		args:       args,
-	}, nil
+	}
+
+	m.maybeUnpackRecoveryTarball()
+
+	return m, nil
 }
 
 // Start starts up a brand new MicroCluster daemon. Only the local control socket will be available at this stage, no
@@ -214,6 +219,20 @@ func (m *MicroCluster) JoinCluster(ctx context.Context, name string, address str
 	return c.ControlDaemon(ctx, internalTypes.Control{JoinToken: token, Address: addr, Name: name, InitConfig: initConfig})
 }
 
+func dumpYamlNodeStore(path string) ([]dqliteClient.NodeInfo, error) {
+	store, err := dqliteClient.NewYamlNodeStore(path)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read %q: %w", path, err)
+	}
+
+	nodeInfo, err := store.Get(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read from node store: %w", err)
+	}
+
+	return nodeInfo, nil
+}
+
 type Member struct {
 	// dqlite.NodeInfo fields
 	DqliteID uint64 `json:"id" yaml:"id"`
@@ -221,6 +240,15 @@ type Member struct {
 	Role     string `json:"role" yaml:"role"`
 
 	Name string `json:"name" yaml:"name"`
+}
+
+func newMember(name string, info dqlite.NodeInfo) Member {
+	return Member{
+		DqliteID: info.ID,
+		Address:  info.Address,
+		Role:     info.Role.String(),
+		Name:     name,
+	}
 }
 
 func (m Member) toNodeInfo() (*dqlite.NodeInfo, error) {
@@ -245,24 +273,14 @@ func (m Member) toNodeInfo() (*dqlite.NodeInfo, error) {
 
 func (m *MicroCluster) GetClusterMembers() ([]Member, error) {
 	storePath := path.Join(m.FileSystem.DatabaseDir, "cluster.yaml")
-	store, err := dqliteClient.NewYamlNodeStore(storePath)
+	nodeInfo, err := dumpYamlNodeStore(storePath)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to read %q: %w", storePath, err)
-	}
-
-	nodeInfo, err := store.Get(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("Failed to read from node store: %w", err)
+		return nil, err
 	}
 
 	var members []Member
 	for _, info := range nodeInfo {
-		members = append(members, Member{
-			DqliteID: info.ID,
-			Address:  info.Address,
-			Role:     info.Role.String(),
-			Name:     "TBD",
-		})
+		members = append(members, newMember("TBD", info))
 	}
 
 	return members, nil
@@ -352,7 +370,7 @@ func (m *MicroCluster) RecoverFromQuorumLoss(members []Member) error {
 	}
 
 	// Tar up the m.FileSystem.DatabaseDir and write to `dbExportPath`
-	createRecoveryTarball(m.FileSystem.StateDir, m.FileSystem.DatabaseDir)
+	m.createRecoveryTarball()
 
 	// Now that the DB has regained quorum, we can modify the entries in the
 	// internal_cluster_members table to indicate that they are down
@@ -363,14 +381,14 @@ func (m *MicroCluster) RecoverFromQuorumLoss(members []Member) error {
 	return nil
 }
 
-func createRecoveryTarball(stateDir string, databaseDir string) error {
-	dbFS := os.DirFS(databaseDir)
+func (m *MicroCluster) createRecoveryTarball() error {
+	dbFS := os.DirFS(m.FileSystem.DatabaseDir)
 	dbFiles, err := fs.Glob(dbFS, "*")
 	if err != nil {
 		return fmt.Errorf("%w", err)
 	}
 
-	tarballPath := path.Join(stateDir, "recovery_db.tar.gz")
+	tarballPath := path.Join(m.FileSystem.StateDir, "recovery_db.tar.gz")
 
 	// info.yaml is used by go-dqlite to keep track of the current cluster member's
 	// ID and address. We shouldn't replicate the recovery member's info.yaml
@@ -384,10 +402,11 @@ func createRecoveryTarball(stateDir string, databaseDir string) error {
 		}
 	}
 
-	return createTarball(tarballPath, databaseDir, dbFiles)
+	return createTarball(tarballPath, m.FileSystem.DatabaseDir, dbFiles)
 }
 
 // create tarball at tarballPath with files path.Join(dir, file)
+// Note: does not handle subdirectories
 func createTarball(tarballPath string, dir string, files []string) error {
 	tarball, err := os.Create(tarballPath)
 	if err != nil {
@@ -484,6 +503,113 @@ func updateTrustStore(dir string, members []Member) error {
 	}
 
 	return remotes.Replace(dir, trustMembers...)
+}
+
+// Check for the presence of a recovery tarball in stateDir. If it exists,
+// unpack it into a temporary directory, ensure that it is a valid microcluster
+// recovery tarball, and replace the existing databaseDir
+func (m *MicroCluster) maybeUnpackRecoveryTarball() error {
+	// Sanity checks:
+	// - /metadata exists
+	// - /cluster.yaml exists
+	// - ?
+
+	tarballPath := path.Join(m.FileSystem.StateDir, "recovery_db.tar.gz")
+	unpackDir := path.Join(m.FileSystem.StateDir, "recovery_db")
+
+	// Determine if the recovery tarball exists
+	if _, err := os.Stat(tarballPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	err := unpackTarball(tarballPath, unpackDir)
+	if err != nil {
+		return err
+	}
+
+	//TODO Is this a reasonable sanity check?
+	metadataPath := path.Join(unpackDir, "metadata1")
+	if _, err := os.Stat(metadataPath); errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("missing %q in recovery tarball", metadataPath)
+	}
+
+	// check for a valid cluster.yaml
+	clusterYamlPath := path.Join(unpackDir, "cluster.yaml")
+	_, err = dumpYamlNodeStore(clusterYamlPath)
+	if err != nil {
+		return err
+	}
+
+	// use the local info.yaml so that the dqlite ID is preserved on each
+	// cluster member
+	localInfoYamlPath := path.Join(m.FileSystem.DatabaseDir, "info.yaml")
+	recoveryInfoYamlPath := path.Join(unpackDir, "info.yaml")
+
+	infoYaml, err := os.ReadFile(localInfoYamlPath)
+	if err != nil {
+		return fmt.Errorf("read %q: %w", localInfoYamlPath, err)
+	}
+
+	err = os.WriteFile(recoveryInfoYamlPath, infoYaml, 0o644)
+	if err != nil {
+		return fmt.Errorf("write %q: %w", recoveryInfoYamlPath, err)
+	}
+
+	// Now that we're as sure as we can be that the recovery DB is valid, we can
+	// replace the existing DB
+	err = os.Rename(unpackDir, m.FileSystem.DatabaseDir)
+	if err != nil {
+		return fmt.Errorf("move %q to %q: %w", unpackDir, m.FileSystem.DatabaseDir, err)
+	}
+
+	// Prevent the database being "restored" after subsequent restarts
+	err = os.Remove(tarballPath)
+	if err != nil {
+		return fmt.Errorf("remove %q: %w", tarballPath, err)
+	}
+
+	//TODO Update the trust store with new member addrs
+
+	return nil
+}
+
+// Note: Does not handle subdirectories
+func unpackTarball(tarballPath string, destRoot string) error {
+	tarball, err := os.Open(tarballPath)
+	if err != nil {
+		return fmt.Errorf("open %q: %w", tarballPath, err)
+	}
+
+	gzReader, err := gzip.NewReader(tarball)
+	if err != nil {
+		return fmt.Errorf("decompress %q: %w", tarballPath, err)
+	}
+
+	tarReader := tar.NewReader(gzReader)
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return fmt.Errorf("unarchive %q: %w", tarballPath, err)
+		}
+
+		filepath := path.Join(destRoot, header.Name)
+		file, err := os.Create(filepath)
+		if err != nil {
+			return fmt.Errorf("open %q: %w", filepath, err)
+		}
+
+		countWritten, err := io.Copy(file, tarReader)
+		if countWritten != header.Size {
+			return fmt.Errorf("mismatched written (%d) and size (%d) for entry %q in %q", countWritten, header.Size, header.Name, tarballPath)
+		} else if err != nil {
+			return fmt.Errorf("write %q: %w", filepath, err)
+		}
+	}
+
+	return nil
 }
 
 // NewJoinToken creates and records a new join token containing all the necessary credentials for joining a cluster.
