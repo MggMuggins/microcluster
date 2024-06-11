@@ -72,14 +72,10 @@ func App(args Args) (*MicroCluster, error) {
 		return nil, err
 	}
 
-	m := &MicroCluster{
+	return &MicroCluster{
 		FileSystem: os,
 		args:       args,
-	}
-
-	m.maybeUnpackRecoveryTarball()
-
-	return m, nil
+	}, nil
 }
 
 // Start starts up a brand new MicroCluster daemon. Only the local control socket will be available at this stage, no
@@ -92,6 +88,11 @@ func (m *MicroCluster) Start(ctx context.Context, extensionsAPI []rest.Endpoint,
 	err := logger.InitLogger(m.FileSystem.LogFile, "", m.args.Verbose, m.args.Debug, nil)
 	if err != nil {
 		return err
+	}
+
+	err = m.maybeUnpackRecoveryTarball()
+	if err != nil {
+		return fmt.Errorf("Database recovery failed: %w", err)
 	}
 
 	// Start up a daemon with a basic control socket.
@@ -335,7 +336,8 @@ func (m *MicroCluster) RecoverFromQuorumLoss(members []Member) error {
 		return fmt.Errorf("cluster members cannot be added or removed during recovery")
 	}
 
-	// Ensure we weren't passed any invalid addresses
+	// Ensure we weren't passed any invalid addresses so that we don't fail to
+	// update the trust store after ReconfigureMembership is called
 	for _, member := range members {
 		_, err = netip.ParseAddrPort(member.Address)
 		if err != nil {
@@ -377,7 +379,10 @@ func (m *MicroCluster) RecoverFromQuorumLoss(members []Member) error {
 	}
 
 	// Tar up the m.FileSystem.DatabaseDir and write to `dbExportPath`
-	m.createRecoveryTarball()
+	err = m.createRecoveryTarball()
+	if err != nil {
+		return err
+	}
 
 	// Now that the DB has regained quorum, we can modify the entries in the
 	// internal_cluster_members table to indicate that they are down
@@ -485,7 +490,7 @@ func readTrustStore(dir string) (*trust.Remotes, error) {
 
 	trustStore, err := trust.Init(fsWatcher, nil, dir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open truststore at %q: %w", dir, err)
 	}
 
 	return trustStore.Remotes(), nil
@@ -500,7 +505,7 @@ func updateTrustStore(dir string, members []Member) error {
 
 	remotesByName := remotes.RemotesByName()
 
-	trustMembers := make([]internalTypes.ClusterMember, len(members))
+	trustMembers := make([]internalTypes.ClusterMember, 0, len(members))
 	for _, member := range members {
 		cert := remotesByName[member.Name].Certificate
 		addr, err := netip.ParseAddrPort(member.Address)
@@ -517,18 +522,18 @@ func updateTrustStore(dir string, members []Member) error {
 		})
 	}
 
-	return remotes.Replace(dir, trustMembers...)
+	err = remotes.Replace(dir, trustMembers...)
+	if err != nil {
+		return fmt.Errorf("update trust store at %q: %w", dir, err)
+	}
+
+	return nil
 }
 
 // Check for the presence of a recovery tarball in stateDir. If it exists,
 // unpack it into a temporary directory, ensure that it is a valid microcluster
 // recovery tarball, and replace the existing databaseDir
 func (m *MicroCluster) maybeUnpackRecoveryTarball() error {
-	// Sanity checks:
-	// - /metadata exists
-	// - /cluster.yaml exists
-	// - ?
-
 	tarballPath := path.Join(m.FileSystem.StateDir, "recovery_db.tar.gz")
 	unpackDir := path.Join(m.FileSystem.StateDir, "recovery_db")
 
@@ -536,6 +541,8 @@ func (m *MicroCluster) maybeUnpackRecoveryTarball() error {
 	if _, err := os.Stat(tarballPath); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+
+	logger.Warn("Recovery tarball located; attempting DB recovery", logger.Ctx{"tarball": tarballPath})
 
 	err := unpackTarball(tarballPath, unpackDir)
 	if err != nil {
@@ -569,6 +576,8 @@ func (m *MicroCluster) maybeUnpackRecoveryTarball() error {
 		}
 	}
 
+	fmt.Println(existingMembers)
+
 	err = updateTrustStore(m.FileSystem.TrustDir, existingMembers)
 	if err != nil {
 		return err
@@ -581,25 +590,32 @@ func (m *MicroCluster) maybeUnpackRecoveryTarball() error {
 
 	infoYaml, err := os.ReadFile(localInfoYamlPath)
 	if err != nil {
-		return fmt.Errorf("read %q: %w", localInfoYamlPath, err)
+		return err
 	}
 
-	err = os.WriteFile(recoveryInfoYamlPath, infoYaml, 0o644)
+	err = os.WriteFile(recoveryInfoYamlPath, infoYaml, 0o664)
 	if err != nil {
-		return fmt.Errorf("write %q: %w", recoveryInfoYamlPath, err)
+		return err
 	}
+
+	//FIXME: Take a DB backup
 
 	// Now that we're as sure as we can be that the recovery DB is valid, we can
 	// replace the existing DB
-	err = os.Rename(unpackDir, m.FileSystem.DatabaseDir)
+	err = os.RemoveAll(m.FileSystem.DatabaseDir)
 	if err != nil {
-		return fmt.Errorf("move %q to %q: %w", unpackDir, m.FileSystem.DatabaseDir, err)
+		return err
 	}
 
-	// Prevent the database being "restored" after subsequent restarts
+	err = os.Rename(unpackDir, m.FileSystem.DatabaseDir)
+	if err != nil {
+		return err
+	}
+
+	// Prevent the database being restored again after subsequent restarts
 	err = os.Remove(tarballPath)
 	if err != nil {
-		return fmt.Errorf("remove %q: %w", tarballPath, err)
+		return err
 	}
 
 	return nil
@@ -619,6 +635,11 @@ func unpackTarball(tarballPath string, destRoot string) error {
 
 	tarReader := tar.NewReader(gzReader)
 
+	err = os.MkdirAll(destRoot, 0o755)
+	if err != nil {
+		return err
+	}
+
 	for {
 		header, err := tarReader.Next()
 		if err == io.EOF {
@@ -630,7 +651,7 @@ func unpackTarball(tarballPath string, destRoot string) error {
 		filepath := path.Join(destRoot, header.Name)
 		file, err := os.Create(filepath)
 		if err != nil {
-			return fmt.Errorf("open %q: %w", filepath, err)
+			return err
 		}
 
 		countWritten, err := io.Copy(file, tarReader)
