@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/canonical/lxd/shared"
 	cli "github.com/canonical/lxd/shared/cmd"
@@ -14,8 +16,28 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"github.com/canonical/microcluster/client"
+	"github.com/canonical/microcluster/cluster"
 	"github.com/canonical/microcluster/microcluster"
 )
+
+const RecoveryConfirmation = `You should only run this command if:
+ - A quorum of cluster members is permanently lost
+ - You are *absolutely* sure all microd instances are stopped
+ - This instance has the most up to date database
+
+Do you want to proceed? (yes/no):`
+
+const RecoveryYamlComment = `# Member roles and addresses can be modified. Unrecoverable nodes should be
+# given the role "spare"
+#
+# "voter" - Voting member of the database. A majority of voters is a quorum.
+# "stand-by" - Non-voting member of the database; can be promoted to voter.
+# "spare" - Not a member of the database.
+#
+# The edit is aborted if:
+# - the number of members changes
+# - the name of any member changes
+# - no changes are made`
 
 type cmdClusterMembers struct {
 	common *CmdControl
@@ -169,7 +191,7 @@ func (c *cmdRecover) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	members, err := m.GetClusterMembers()
+	members, err := m.GetLocalClusterMembers()
 	if err != nil {
 		return err
 	}
@@ -186,16 +208,27 @@ func (c *cmdRecover) Run(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	} else {
-		//FIXME: Editor comment
+		reader := bufio.NewReader(os.Stdin)
+		fmt.Print(RecoveryConfirmation)
 
-		content, err = shared.TextEditor("", membersYaml)
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSuffix(input, "\n")
+
+		if strings.ToLower(input) != "yes" {
+			return fmt.Errorf("Cluster edit aborted; no changes made")
+		}
+
+		content, err = shared.TextEditor(RecoveryYamlComment, membersYaml)
 		if err != nil {
 			return err
 		}
 	}
 
-	newMembers := []microcluster.Member{}
+	newMembers := []cluster.Member{}
 	err = yaml.Unmarshal(content, &newMembers)
+	if err != nil {
+		return err
+	}
 
 	err = m.RecoverFromQuorumLoss(newMembers)
 	if err != nil {
