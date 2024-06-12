@@ -121,8 +121,7 @@ func (d *Daemon) Run(ctx context.Context, listenPort string, stateDir string, so
 		return fmt.Errorf("Failed to initialize directory structure: %w", err)
 	}
 
-	//TODO Maybe move to Daemon - update address changes? Only one DB update is
-	// needed
+	//TODO update address changes? Only one DB update is needed
 	err = recover.MaybeUnpackRecoveryTarball(d.os)
 	if err != nil {
 		return fmt.Errorf("Database recovery failed: %w", err)

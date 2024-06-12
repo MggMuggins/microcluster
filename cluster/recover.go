@@ -7,6 +7,8 @@ import (
 	dqliteClient "github.com/canonical/go-dqlite/client"
 )
 
+// Member is the information that can be derived locally about a cluster member
+// without access to the dqlite database.
 type Member struct {
 	// dqlite.NodeInfo fields
 	DqliteID uint64 `json:"id" yaml:"id"`
@@ -16,7 +18,8 @@ type Member struct {
 	Name string `json:"name" yaml:"name"`
 }
 
-func (m Member) ToNodeInfo() (*dqlite.NodeInfo, error) {
+// NodeInfo is used for interop with go-dqlite
+func (m Member) NodeInfo() (*dqlite.NodeInfo, error) {
 	var role dqliteClient.NodeRole
 	switch m.Role {
 	case "voter":

@@ -209,6 +209,11 @@ func (m *MicroCluster) JoinCluster(ctx context.Context, name string, address str
 	return c.ControlDaemon(ctx, internalTypes.Control{JoinToken: token, Address: addr, Name: name, InitConfig: initConfig})
 }
 
+// GetLocalClusterMembers retrieves the current local cluster configuration
+// (derived from the trust store & dqlite metadata); it does not query the
+// database.
+// This is primarily intended for modifying the cluster configuration via
+// MicroCluster.RecoverFromQuorumLoss.
 func (m *MicroCluster) GetLocalClusterMembers() ([]cluster.Member, error) {
 	return recover.GetLocalClusterMembers(m.FileSystem)
 }
@@ -244,7 +249,12 @@ func (m *MicroCluster) RecoverFromQuorumLoss(members []cluster.Member) error {
 	countNewMembers := 0
 	for _, newMember := range members {
 		for _, oldMember := range oldMembers {
-			if newMember.DqliteID == oldMember.DqliteID && newMember.Name == oldMember.Name {
+			//FIXME: Allow changing member addresses as part of cluster recovery
+			membersMatch := newMember.DqliteID == oldMember.DqliteID &&
+				newMember.Name == oldMember.Name &&
+				newMember.Address == oldMember.Address
+
+			if membersMatch {
 				countNewMembers += 1
 				break
 			}
@@ -267,7 +277,7 @@ func (m *MicroCluster) RecoverFromQuorumLoss(members []cluster.Member) error {
 	// Set up our new cluster configuration
 	nodeInfo := make([]dqlite.NodeInfo, 0, len(members))
 	for _, member := range members {
-		info, err := member.ToNodeInfo()
+		info, err := member.NodeInfo()
 		if err != nil {
 			return err
 		}
